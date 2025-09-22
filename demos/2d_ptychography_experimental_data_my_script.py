@@ -19,7 +19,7 @@ for i in [':', '-', ' ']:
 
 DEFAULT_BACKGROUND_PATH = (
     r"C:\Users\erobe\OneDrive - University of Saskatchewan\Resources\Data"
-    r"\Joseph - PtychoRec\Reconstruction Data\A230127060bg_1_1.tif"
+    r"\Joseph - PtychoRec\Reconstruction Data\A230127060bg_1_1_centered.tif"
 )
 
 parser = argparse.ArgumentParser()
