@@ -835,7 +835,7 @@ class SparseMultisliceModel(ForwardModel):
                         ex_int = temp_real ** 2 + temp_imag ** 2
                     else:
                         ex_int = ex_int + temp_real ** 2 + temp_imag ** 2
-                  ex_int_ls.append(ex_int)
+                ex_int_ls.append(ex_int)
         del subobj_ls, probe_real_ls, probe_imag_ls
 
         # Output shape is [minibatch_size, y, x].

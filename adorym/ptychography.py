@@ -273,12 +273,59 @@ def reconstruct_ptychography(
     detector_shape = prj.shape[-2:]
     n_pos_detector = prj.shape[1]
     if rank == 0:
+        def _load_background_from_file(file_path, key=None):
+            file_path = os.path.expanduser(file_path)
+            if not os.path.isfile(file_path):
+                raise FileNotFoundError('Background file {} not found.'.format(file_path))
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext in ['.tif', '.tiff']:
+                try:
+                    import tifffile
+                except ImportError as exc:
+                    raise ImportError('tifffile is required to load TIFF backgrounds.') from exc
+                data = tifffile.imread(file_path)
+            elif ext == '.npy':
+                data = np.load(file_path)
+            elif ext == '.npz':
+                with np.load(file_path) as npz_file:
+                    if key is None:
+                        if len(npz_file.files) == 1:
+                            data = npz_file[npz_file.files[0]]
+                        elif 'arr_0' in npz_file.files:
+                            data = npz_file['arr_0']
+                        else:
+                            raise ValueError('Multiple arrays found in {}. Specify "key" in background_initial.'.format(file_path))
+                    else:
+                        if key not in npz_file:
+                            raise KeyError('Key {} not found in {}.'.format(key, file_path))
+                        data = npz_file[key]
+            else:
+                raise ValueError('Unsupported background file extension {}.'.format(ext))
+            return np.array(data, dtype='float32', copy=False)
+
         background_init_arr = None
         if background_type == 'none':
             background_init_arr = 0.
         else:
             if background_initial is not None:
-                background_init_arr = np.array(background_initial, dtype='float32')
+                background_candidate = background_initial
+                if isinstance(background_candidate, dict):
+                    if 'array' in background_candidate:
+                        background_candidate = background_candidate['array']
+                    elif 'path' in background_candidate:
+                        background_candidate = _load_background_from_file(
+                            background_candidate['path'],
+                            background_candidate.get('key', None))
+                    else:
+                        raise ValueError('background_initial dict must contain "array" or "path".')
+                elif isinstance(background_candidate, str):
+                    candidate_path = os.path.expanduser(background_candidate)
+                    if os.path.isfile(candidate_path):
+                        background_candidate = _load_background_from_file(candidate_path)
+                    else:
+                        raise ValueError('background_initial string must be a valid file path. '
+                                         'Use background_dataset_path for HDF5 datasets.')
+                background_init_arr = np.array(background_candidate, dtype='float32', copy=False)
             elif background_dataset_path is not None:
                 try:
                     background_init_arr = np.array(f[background_dataset_path][...], dtype='float32')
