@@ -26,7 +26,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--epoch', default='None')
 parser.add_argument('--save_path', default='cone_256_foam_ptycho')
 parser.add_argument('--output_folder', default='test')  # Will create epoch folders under this
+
 parser.add_argument('--background-type', default='per_detector',
+
                     choices=['none', 'per_detector', 'per_angle', 'per_pattern'])
 parser.add_argument('--background-path', default=None,
                     help='Optional path to an external background file (TIFF/NumPy).')
@@ -155,7 +157,6 @@ def load_background_from_file(file_path, npz_key=None):
         raise ValueError(f'Unsupported background file extension: {ext}')
     return np.array(data, dtype=np.float32)
 
-
 background_initial = None
 background_path = args.background_path if args.background_path is not None else DEFAULT_BACKGROUND_PATH
 if background_path is not None:
@@ -174,6 +175,7 @@ if background_path is not None:
 elif args.background_type != 'none' and args.background_dataset is None:
     print('Warning: background_type is set but no background data provided.')
 
+
 if background_initial is not None:
     background_initial = np.array(background_initial, dtype=np.float32, copy=False)
 
@@ -187,7 +189,7 @@ params_2idd_gpu = {'fname': r"D:\Joseph Reconstruction\h5 files\data_3.h5",
                     'psize_cm': 1.3365e-06,
                     'minibatch_size': 5,
                     'output_folder': 'data_3_bgsub_20250915_supplied_2',
-                    'cpu_only': False,
+                    'cpu_only': True,
                     'save_path': r'D:\Joseph Reconstruction\Reconstructions',
                     'use_checkpoint': False,
                     'n_epoch_final_pass': None,
