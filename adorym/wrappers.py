@@ -63,6 +63,7 @@ func_mapping_dict = {'zeros':       {'autograd': 'zeros',      'tensorflow': 'ze
                      'nonzero':     {'autograd': 'nonzero',    'tensorflow': 'nonzero',    'pytorch': 'nonzero'},
                      'sign':        {'autograd': 'sign',       'tensorflow': 'sign',       'pytorch': 'sign',       'numpy': 'sign'},
                      'argmax':      {'autograd': 'argmax',     'tensorflow': 'argmax',     'pytorch': 'argmax',     'numpy': 'argmax'},
+                     'maximum':     {'autograd': 'maximum',    'tensorflow': 'maximum',    'pytorch': 'maximum',    'numpy': 'maximum'},
                      'tensordot':   {'autograd': 'tensordot',  'tensorflow': 'tensordot',  'pytorch': 'tensordot',  'numpy': 'tensordot'},
                      }
 
@@ -199,6 +200,23 @@ def to_numpy(var, backend='autograd'):
                     return var.cpu().double().data.numpy()
                 else:
                     return var.cpu().data.numpy()
+
+
+@set_bn
+def maximum(a, b, backend='autograd'):
+    if backend == 'autograd':
+        return anp.maximum(a, b)
+    elif backend == 'pytorch':
+        if not tc.is_tensor(a):
+            a = tc.as_tensor(a, dtype=b.dtype if tc.is_tensor(b) else None,
+                             device=b.device if tc.is_tensor(b) else None)
+        if not tc.is_tensor(b):
+            b = tc.as_tensor(b, dtype=a.dtype, device=a.device)
+        if hasattr(tc, 'maximum'):
+            return tc.maximum(a, b)
+        return tc.where(a >= b, a, b)
+    else:
+        return np.maximum(a, b)
 
 
 @set_bn
