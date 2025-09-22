@@ -1,5 +1,4 @@
 import h5py
-import tiff
 import tifffile
 
 from adorym.ptychography import reconstruct_ptychography
@@ -18,10 +17,31 @@ for i in [':', '-', ' ']:
     else:
         timestr = timestr.replace(i, '')
 
+DEFAULT_BACKGROUND_PATH = (
+    r"C:\Users\erobe\OneDrive - University of Saskatchewan\Resources\Data"
+    r"\Joseph - PtychoRec\Reconstruction Data\A230127060bg_1_1.tif"
+)
+
 parser = argparse.ArgumentParser()
 parser.add_argument('--epoch', default='None')
 parser.add_argument('--save_path', default='cone_256_foam_ptycho')
-parser.add_argument('--output_folder', default='test') # Will create epoch folders under this
+parser.add_argument('--output_folder', default='test')  # Will create epoch folders under this
+parser.add_argument('--background-type', default='per_detector',
+                    choices=['none', 'per_detector', 'per_angle', 'per_pattern'])
+parser.add_argument('--background-path', default=None,
+                    help='Optional path to an external background file (TIFF/NumPy).')
+parser.add_argument('--background-dataset', default=None,
+                    help='Optional HDF5 dataset path inside the projection file.')
+parser.add_argument('--background-mean-axis', type=int, default=0,
+                    help='Axis over which to compute the mean when reducing a background stack.')
+parser.add_argument('--skip-background-mean', action='store_true',
+                    help='Keep the loaded background stack without averaging along background-mean-axis.')
+parser.add_argument('--background-npz-key', default=None,
+                    help='Array key to use when loading background data from a .npz archive.')
+parser.add_argument('--optimize-background', action='store_true',
+                    help='Enable background optimisation during reconstruction.')
+parser.add_argument('--background-learning-rate', type=float, default=1e-3,
+                    help='Learning rate for the background optimiser when enabled.')
 args = parser.parse_args()
 epoch = args.epoch
 if epoch == 'None':
@@ -111,10 +131,51 @@ ph0 = tifffile.imread(r"C:\Users\erobe\OneDrive - University of Saskatchewan\Res
 probe_mag_phase = [mag0, ph0]              # what ADORYM expects for 'supplied'
 probe_mag_phase = np.array(probe_mag_phase)  # optional; list is fine
 
-background_path = r"C:\Users\erobe\OneDrive - University of Saskatchewan\Resources\Data\Joseph - PtychoRec\Reconstruction Data\A230127060bg_1_1.tif"
-bg_stack = tiff.imread(background_path)
+def load_background_from_file(file_path, npz_key=None):
+    file_path = os.path.expanduser(file_path)
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in ['.tif', '.tiff']:
+        data = tifffile.imread(file_path)
+    elif ext == '.npy':
+        data = np.load(file_path)
+    elif ext == '.npz':
+        with np.load(file_path) as npz_file:
+            if npz_key is not None:
+                if npz_key not in npz_file:
+                    raise KeyError(f'Key "{npz_key}" not found in {file_path}.')
+                data = npz_file[npz_key]
+            elif len(npz_file.files) == 1:
+                data = npz_file[npz_file.files[0]]
+            elif 'arr_0' in npz_file:
+                data = npz_file['arr_0']
+            else:
+                raise ValueError(
+                    f'Multiple arrays found in {file_path}. Provide --background-npz-key to select one.')
+    else:
+        raise ValueError(f'Unsupported background file extension: {ext}')
+    return np.array(data, dtype=np.float32)
 
-bg_mean = np.mean(bg_stack, axis=0)
+
+background_initial = None
+background_path = args.background_path if args.background_path is not None else DEFAULT_BACKGROUND_PATH
+if background_path is not None:
+    background_file = os.path.expanduser(background_path)
+    if os.path.isfile(background_file):
+        background_data = load_background_from_file(background_file, args.background_npz_key)
+        if not args.skip_background_mean and background_data.ndim > 2:
+            background_initial = np.mean(background_data, axis=args.background_mean_axis)
+        else:
+            background_initial = background_data
+    else:
+        if args.background_path is not None:
+            raise FileNotFoundError(f'Background file not found: {args.background_path}')
+        else:
+            print('Warning: default background file not found. Continuing without background_initial.')
+elif args.background_type != 'none' and args.background_dataset is None:
+    print('Warning: background_type is set but no background data provided.')
+
+if background_initial is not None:
+    background_initial = np.array(background_initial, dtype=np.float32, copy=False)
 
 params_2idd_gpu = {'fname': r"D:\Joseph Reconstruction\h5 files\data_3.h5",
                     'theta_st': 0,
@@ -155,7 +216,7 @@ params_2idd_gpu = {'fname': r"D:\Joseph Reconstruction\h5 files\data_3.h5",
                     'backend': 'pytorch',
                     'raw_data_type': 'intensity',
                     'beamstop': None,
-                   'randomize_probe_pos': True,
+                    'randomize_probe_pos': True,
                     'optimizer': optimizer_obj,
                     'optimize_probe': True,
                     'optimizer_probe': optimizer_probe,
@@ -168,6 +229,15 @@ params_2idd_gpu = {'fname': r"D:\Joseph Reconstruction\h5 files\data_3.h5",
                     'loss_function_type': 'lsq',
                     # 'normalize_fft': False
                     }
+
+params_2idd_gpu['background_type'] = args.background_type
+if args.background_dataset is not None:
+    params_2idd_gpu['background_dataset_path'] = args.background_dataset
+if background_initial is not None:
+    params_2idd_gpu['background_initial'] = background_initial
+if args.optimize_background:
+    params_2idd_gpu['optimize_background'] = True
+    params_2idd_gpu['background_learning_rate'] = args.background_learning_rate
 
 params = params_2idd_gpu
 
