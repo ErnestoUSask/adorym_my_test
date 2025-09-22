@@ -873,6 +873,31 @@ def clip(var, a1, a2, backend='autograd'):
 
 
 @set_bn
+def expand_dims(var, axis, backend='autograd'):
+    if backend == 'autograd':
+        return anp.expand_dims(var, axis)
+    elif backend == 'pytorch':
+        arr = var if isinstance(var, tc.Tensor) else tc.tensor(var)
+        if not isinstance(axis, (tuple, list)):
+            axes = [axis]
+        else:
+            axes = list(axis)
+        ndim = arr.dim()
+        normalized_axes = []
+        for ax in axes:
+            if ax < 0:
+                ax = ax + ndim + 1
+            normalized_axes.append(ax)
+        normalized_axes.sort()
+        for ax in normalized_axes:
+            arr = tc.unsqueeze(arr, dim=ax)
+            ndim += 1
+        return arr
+    else:
+        return np.expand_dims(var, axis)
+
+
+@set_bn
 def reshape(var, newshape, backend='autograd'):
     func = getattr(engine_dict[backend], func_mapping_dict['reshape'][backend])
     arr = func(var, newshape)
