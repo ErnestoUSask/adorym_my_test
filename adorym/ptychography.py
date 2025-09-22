@@ -119,6 +119,12 @@ def reconstruct_ptychography(
         # Use sign_convention = 1 for Goodman convention: exp(ikz); n = 1 - delta + i * beta
         # Use sign_convention = -1 for opposite convention: exp(-ikz); n = 1 - delta - i * beta
         fourier_disparity=False,
+        background_type='none',
+        background_dataset_path=None,
+        background_initial=None,
+        optimize_background=False,
+        background_learning_rate=1e-3,
+        optimizer_background=None,
         # _____
         # |I/O|_________________________________________________________________
         save_path='.', output_folder=None, save_intermediate=False, save_intermediate_level='batch', save_history=False,
@@ -259,6 +265,93 @@ def reconstruct_ptychography(
         n_theta = len(theta_ls)
 
     original_shape = [n_theta, *prj.shape[1:]]
+
+    valid_background_types = ['none', 'per_detector', 'per_angle', 'per_pattern']
+    if background_type not in valid_background_types:
+        raise ValueError('background_type must be one of {}.'.format(valid_background_types))
+
+    detector_shape = prj.shape[-2:]
+    n_pos_detector = prj.shape[1]
+    if rank == 0:
+        background_init_arr = None
+        if background_type == 'none':
+            background_init_arr = 0.
+        else:
+            if background_initial is not None:
+                background_init_arr = np.array(background_initial, dtype='float32')
+            elif background_dataset_path is not None:
+                try:
+                    background_init_arr = np.array(f[background_dataset_path][...], dtype='float32')
+                except KeyError:
+                    raise KeyError('Dataset {} not found in file {}.'.format(background_dataset_path, fname))
+            if background_init_arr is None:
+                if background_type == 'per_detector':
+                    background_init_arr = np.zeros(detector_shape, dtype='float32')
+                elif background_type == 'per_angle':
+                    background_init_arr = np.zeros([n_theta, *detector_shape], dtype='float32')
+                elif background_type == 'per_pattern':
+                    background_init_arr = np.zeros([n_theta, n_pos_detector, *detector_shape], dtype='float32')
+            else:
+                if background_type == 'per_detector':
+                    if background_init_arr.ndim == 0:
+                        background_init_arr = np.full(detector_shape, float(background_init_arr), dtype='float32')
+                    elif background_init_arr.ndim == 2:
+                        if tuple(background_init_arr.shape) != tuple(detector_shape):
+                            raise ValueError('Initial detector background must have shape {}.'.format(detector_shape))
+                    elif background_init_arr.ndim == 3:
+                        if tuple(background_init_arr.shape[1:]) != tuple(detector_shape):
+                            raise ValueError('Initial detector background must have trailing shape {}.'.format(detector_shape))
+                        background_init_arr = background_init_arr[prj_theta_ind]
+                        background_init_arr = background_init_arr.mean(axis=0)
+                    else:
+                        raise ValueError('Unsupported detector background shape {}.'.format(background_init_arr.shape))
+                elif background_type == 'per_angle':
+                    if background_init_arr.ndim == 2:
+                        if tuple(background_init_arr.shape) != tuple(detector_shape):
+                            raise ValueError('Initial per_angle background must have shape ({}).'.format(detector_shape))
+                        background_init_arr = np.tile(background_init_arr[None, ...], [n_theta, 1, 1])
+                    elif background_init_arr.ndim == 3:
+                        if background_init_arr.shape[1:] != tuple(detector_shape):
+                            raise ValueError('Initial per_angle background must have trailing shape {}.'.format(detector_shape))
+                        if background_init_arr.shape[0] == prj.shape[0]:
+                            background_init_arr = background_init_arr[prj_theta_ind]
+                        elif background_init_arr.shape[0] != n_theta:
+                            raise ValueError('Initial per_angle background first dimension must be {}.'.format(n_theta))
+                    else:
+                        raise ValueError('Unsupported per_angle background shape {}.'.format(background_init_arr.shape))
+                elif background_type == 'per_pattern':
+                    if background_init_arr.ndim == 2:
+                        if tuple(background_init_arr.shape) != tuple(detector_shape):
+                            raise ValueError('Initial per_pattern background must match detector shape {}.'.format(detector_shape))
+                        background_init_arr = np.tile(background_init_arr[None, None, ...], [n_theta, n_pos_detector, 1, 1])
+                    elif background_init_arr.ndim == 3:
+                        if tuple(background_init_arr.shape[1:]) != tuple(detector_shape):
+                            raise ValueError('Initial per_pattern background must have trailing shape {}.'.format(detector_shape))
+                        if background_init_arr.shape[0] == prj.shape[0]:
+                            background_init_arr = background_init_arr[prj_theta_ind]
+                            background_init_arr = np.tile(background_init_arr[:, None, :, :], [1, n_pos_detector, 1, 1])
+                        elif background_init_arr.shape[0] == n_theta:
+                            background_init_arr = np.tile(background_init_arr[:, None, :, :], [1, n_pos_detector, 1, 1])
+                        else:
+                            raise ValueError('Initial per_pattern background first dimension must be {}.'.format(n_theta))
+                    elif background_init_arr.ndim == 4:
+                        if background_init_arr.shape[-2:] != tuple(detector_shape):
+                            raise ValueError('Initial per_pattern background must have detector shape in last two dims.')
+                        if background_init_arr.shape[0] == prj.shape[0]:
+                            background_init_arr = background_init_arr[prj_theta_ind]
+                        elif background_init_arr.shape[0] != n_theta:
+                            raise ValueError('Initial per_pattern background first dimension must be {}.'.format(n_theta))
+                        if background_init_arr.shape[1] != n_pos_detector:
+                            raise ValueError('Initial per_pattern background second dimension must be {}.'.format(n_pos_detector))
+                    else:
+                        raise ValueError('Unsupported per_pattern background shape {}.'.format(background_init_arr.shape))
+                    background_init_arr = background_init_arr.astype('float32', copy=False)
+    else:
+        background_init_arr = None
+
+    if background_type != 'none' and not np.isscalar(background_init_arr):
+        background_init_arr = np.array(background_init_arr, dtype='float32', copy=False)
+    background_init_arr = comm.bcast(background_init_arr, root=0)
 
     # Probe position.
     if probe_pos is None:
@@ -705,6 +798,13 @@ def reconstruct_ptychography(
             optimizable_params['probe_pos_offset'] = w.zeros([n_theta, 2], requires_grad=True, device=device_obj)
             optimizable_params['prj_pos_offset'] = w.zeros([n_theta, 2], requires_grad=True, device=device_obj)
 
+            if background_type == 'none':
+                optimizable_params['background'] = w.create_variable(0., requires_grad=False, device=device_obj)
+            else:
+                optimizable_params['background'] = w.create_variable(background_init_arr,
+                                                                     requires_grad=optimize_background,
+                                                                     device=device_obj)
+
             if is_multi_dist:
                 optimizable_params['probe_pos_correction'] = w.create_variable(np.zeros([n_dists, 2]),
                                                              requires_grad=optimize_all_probe_pos, device=device_obj)
@@ -717,6 +817,19 @@ def reconstruct_ptychography(
 
             if is_sparse_multislice:
                 optimizable_params['slice_pos_cm_ls'] = w.create_variable(slice_pos_cm_ls, requires_grad=optimize_slice_pos, device=device_obj)
+
+        else:
+            if 'background' not in optimizable_params:
+                if background_type == 'none':
+                    optimizable_params['background'] = w.create_variable(0., requires_grad=False, device=device_obj)
+                else:
+                    optimizable_params['background'] = w.create_variable(background_init_arr,
+                                                                         requires_grad=optimize_background,
+                                                                         device=device_obj)
+            else:
+                optimizable_params['background'] = w.create_variable(optimizable_params['background'],
+                                                                     requires_grad=(background_type != 'none' and optimize_background),
+                                                                     device=device_obj)
 
             if is_multi_dist:
                 if optimize_free_prop:

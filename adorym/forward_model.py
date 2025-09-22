@@ -178,7 +178,7 @@ class PtychographyModel(ForwardModel):
 
     def predict(self, obj, probe_real, probe_imag, probe_defocus_mm,
                 probe_pos_offset, this_i_theta, this_pos_batch, prj,
-                probe_pos_correction, this_ind_batch, tilt_ls, prj_pos_offset):
+                background, probe_pos_correction, this_ind_batch, tilt_ls, prj_pos_offset):
         """
         Calculated predicted measurment. The signature of this function exactly matches the function returned
         by the ``get_loss_function`` method.
@@ -280,7 +280,8 @@ class PtychographyModel(ForwardModel):
                 raise NotImplementedError('Tilt optimization is not impemented for distributed mode or when two_d_mode is on.')
             obj_rot = obj
 
-        ex_mag_ls = []
+        background_type = self.common_vars.get('background_type', 'none')
+        ex_int_ls = []
 
         # Pad if needed
         if self.distribution_mode is None:
@@ -350,7 +351,7 @@ class PtychographyModel(ForwardModel):
                                 type=unknown_type, normalize_fft=self.normalize_fft, sign_convention=self.sign_convention,
                                 scale_ri_by_k=self.scale_ri_by_k, is_minus_logged=self.is_minus_logged,
                                 pure_projection_return_sqrt=flag_pp_sqrt, shift_exit_wave=this_prj_offset)
-                ex_mag_ls.append(w.norm(ex_real, ex_imag))
+                ex_int_ls.append(ex_real ** 2 + ex_imag ** 2)
             else:
                 for i_mode in range(n_probe_modes):
                     if len(probe_real_ls.shape) == 3:
@@ -372,14 +373,33 @@ class PtychographyModel(ForwardModel):
                         ex_int = temp_real ** 2 + temp_imag ** 2
                     else:
                         ex_int = ex_int + temp_real ** 2 + temp_imag ** 2
-                ex_mag_ls.append(w.sqrt(ex_int))
+                ex_int_ls.append(ex_int)
         del subobj_ls, probe_real_ls, probe_imag_ls
 
         # Output shape is [minibatch_size, y, x].
-        if len(ex_mag_ls) > 1:
-            ex_mag_ls = w.concatenate(ex_mag_ls, 0)
+        if len(ex_int_ls) > 1:
+            ex_int = w.concatenate(ex_int_ls, 0)
         else:
-            ex_mag_ls = ex_mag_ls[0]
+            ex_int = ex_int_ls[0]
+
+        if background_type != 'none' and background is not None:
+            if background_type == 'per_detector':
+                bg = w.expand_dims(background, axis=0)
+                bg = w.tile(bg, [ex_int.shape[0], 1, 1])
+            elif background_type == 'per_angle':
+                bg = background[this_i_theta]
+                if len(bg.shape) == 2:
+                    bg = w.expand_dims(bg, axis=0)
+                bg = w.tile(bg, [ex_int.shape[0], 1, 1])
+            elif background_type == 'per_pattern':
+                indexer = list(this_ind_batch)
+                bg = background[this_i_theta, indexer]
+            else:
+                raise ValueError('Unsupported background_type: {}'.format(background_type))
+            ex_int = ex_int + bg
+
+        ex_int = w.maximum(ex_int, 0)
+        ex_mag_ls = w.sqrt(ex_int)
         if rank == 0 and debug and self.i_call % 10 == 0:
             ex_mag_val = w.to_numpy(ex_mag_ls)
             dxchange.write_tiff(ex_mag_val, os.path.join(output_folder, 'intermediate', 'detected_mag'), dtype='float32', overwrite=True)
@@ -389,12 +409,12 @@ class PtychographyModel(ForwardModel):
     def get_loss_function(self):
         def calculate_loss(obj, probe_real, probe_imag, probe_defocus_mm,
                            probe_pos_offset, this_i_theta, this_pos_batch, prj,
-                           probe_pos_correction, this_ind_batch, tilt_ls, prj_pos_offset):
+                           background, probe_pos_correction, this_ind_batch, tilt_ls, prj_pos_offset):
             theta_downsample = self.common_vars['theta_downsample']
             ds_level = self.common_vars['ds_level']
             this_pred_batch = self.predict(obj, probe_real, probe_imag, probe_defocus_mm,
                                            probe_pos_offset, this_i_theta, this_pos_batch, prj,
-                                           probe_pos_correction, this_ind_batch, tilt_ls, prj_pos_offset)
+                                           background, probe_pos_correction, this_ind_batch, tilt_ls, prj_pos_offset)
             this_prj_batch = self.get_data(this_i_theta, this_ind_batch, theta_downsample=theta_downsample, ds_level=ds_level)
             loss = self.loss(this_pred_batch, this_prj_batch, obj)
             return loss
@@ -411,7 +431,7 @@ class SingleBatchFullfieldModel(PtychographyModel):
 
     def predict(self, obj, probe_real, probe_imag, probe_defocus_mm,
                 probe_pos_offset, this_i_theta, this_pos_batch, prj,
-                probe_pos_correction, this_ind_batch, tilt_ls, prj_pos_offset):
+                background, probe_pos_correction, this_ind_batch, tilt_ls, prj_pos_offset):
         """
         Calculated predicted measurment. The signature of this function exactly matches the function returned
         by the ``get_loss_function`` method.
@@ -445,6 +465,7 @@ class SingleBatchFullfieldModel(PtychographyModel):
         n_theta = self.common_vars['n_theta']
         precalculate_rotation_coords = self.common_vars['precalculate_rotation_coords']
         theta_ls = self.common_vars['theta_ls']
+        background_type = self.common_vars.get('background_type', 'none')
 
         if precalculate_rotation_coords:
             coord_ls = read_origin_coords('arrsize_{}_{}_{}_ntheta_{}'.format(*this_obj_size, n_theta),
@@ -482,7 +503,25 @@ class SingleBatchFullfieldModel(PtychographyModel):
             type=unknown_type, normalize_fft=self.normalize_fft, sign_convention=self.sign_convention,
             scale_ri_by_k=self.scale_ri_by_k, is_minus_logged=self.is_minus_logged,
             pure_projection_return_sqrt=flag_pp_sqrt, shift_exit_wave=this_prj_offset)
-        ex_mag_ls = w.norm(ex_real, ex_imag)
+        ex_int = ex_real ** 2 + ex_imag ** 2
+        if background_type != 'none' and background is not None:
+            if background_type == 'per_detector':
+                bg = background
+            elif background_type == 'per_angle':
+                bg = background[this_i_theta]
+            elif background_type == 'per_pattern':
+                if isinstance(this_ind_batch, (list, tuple)):
+                    index = this_ind_batch[0]
+                else:
+                    index = this_ind_batch[0] if hasattr(this_ind_batch, '__getitem__') else int(this_ind_batch)
+                bg = background[this_i_theta, index]
+            else:
+                raise ValueError('Unsupported background_type: {}'.format(background_type))
+            if len(bg.shape) == 3:
+                bg = bg[0]
+            ex_int = ex_int + bg
+        ex_int = w.maximum(ex_int, 0)
+        ex_mag_ls = w.sqrt(ex_int)
 
         if self.simulation_mode:
             return ex_real, ex_imag
@@ -500,7 +539,7 @@ class SingleBatchPtychographyModel(PtychographyModel):
 
     def predict(self, obj, probe_real, probe_imag, probe_defocus_mm,
                 probe_pos_offset, this_i_theta, this_pos_batch, prj,
-                probe_pos_correction, this_ind_batch, tilt_ls, prj_pos_offset):
+                background, probe_pos_correction, this_ind_batch, tilt_ls, prj_pos_offset):
         """
         Calculated predicted measurment. The signature of this function exactly matches the function returned
         by the ``get_loss_function`` method.
@@ -535,6 +574,7 @@ class SingleBatchPtychographyModel(PtychographyModel):
         precalculate_rotation_coords = self.common_vars['precalculate_rotation_coords']
         theta_ls = self.common_vars['theta_ls']
         optimize_prj_pos_offset = self.common_vars['optimize_prj_pos_offset']
+        background_type = self.common_vars.get('background_type', 'none')
 
         if precalculate_rotation_coords:
             coord_ls = read_origin_coords('arrsize_{}_{}_{}_ntheta_{}'.format(*this_obj_size, n_theta),
@@ -581,7 +621,25 @@ class SingleBatchPtychographyModel(PtychographyModel):
             type=unknown_type, normalize_fft=self.normalize_fft, sign_convention=self.sign_convention,
             scale_ri_by_k=self.scale_ri_by_k, is_minus_logged=self.is_minus_logged,
             pure_projection_return_sqrt=flag_pp_sqrt, shift_exit_wave=this_prj_offset)
-        ex_mag_ls = w.norm(ex_real, ex_imag)
+        ex_int = ex_real ** 2 + ex_imag ** 2
+        if background_type != 'none' and background is not None:
+            if background_type == 'per_detector':
+                bg = background
+            elif background_type == 'per_angle':
+                bg = background[this_i_theta]
+            elif background_type == 'per_pattern':
+                if isinstance(this_ind_batch, (list, tuple)):
+                    idx = this_ind_batch[0]
+                else:
+                    idx = this_ind_batch[0] if hasattr(this_ind_batch, '__getitem__') else int(this_ind_batch)
+                bg = background[this_i_theta, idx]
+            else:
+                raise ValueError('Unsupported background_type: {}'.format(background_type))
+            if len(bg.shape) == 3:
+                bg = bg[0]
+            ex_int = ex_int + bg
+        ex_int = w.maximum(ex_int, 0)
+        ex_mag_ls = w.sqrt(ex_int)
 
         return ex_mag_ls
 
@@ -601,7 +659,7 @@ class SparseMultisliceModel(ForwardModel):
 
     def predict(self, obj, probe_real, probe_imag, probe_defocus_mm,
                 probe_pos_offset, this_i_theta, this_pos_batch, prj,
-                probe_pos_correction, this_ind_batch, slice_pos_cm_ls,
+                background, probe_pos_correction, this_ind_batch, slice_pos_cm_ls,
                 prj_pos_offset):
         """
         Calculated predicted measurment. The signature of this function exactly matches the function returned
@@ -651,6 +709,7 @@ class SparseMultisliceModel(ForwardModel):
         theta_ls = self.common_vars['theta_ls']
         u = self.common_vars['u']
         v = self.common_vars['v']
+        background_type = self.common_vars.get('background_type', 'none')
 
         if precalculate_rotation_coords:
             coord_ls = read_origin_coords('arrsize_{}_{}_{}_ntheta_{}'.format(*this_obj_size, n_theta),
@@ -690,7 +749,7 @@ class SparseMultisliceModel(ForwardModel):
         else:
             obj_rot = obj
 
-        ex_mag_ls = []
+        ex_int_ls = []
 
         # Pad if needed
         if not self.distribution_mode:
@@ -755,7 +814,7 @@ class SparseMultisliceModel(ForwardModel):
                                 fresnel_approx=fresnel_approx, device=device_obj,
                                 type=unknown_type, normalize_fft=self.normalize_fft, sign_convention=self.sign_convention,
                                 scale_ri_by_k=self.scale_ri_by_k, shift_exit_wave=this_prj_offset)
-                ex_mag_ls.append(w.norm(ex_real, ex_imag))
+                ex_int_ls.append(ex_real ** 2 + ex_imag ** 2)
             else:
                 for i_mode in range(n_probe_modes):
                     if len(probe_real_ls.shape) == 3:
@@ -776,14 +835,33 @@ class SparseMultisliceModel(ForwardModel):
                         ex_int = temp_real ** 2 + temp_imag ** 2
                     else:
                         ex_int = ex_int + temp_real ** 2 + temp_imag ** 2
-                ex_mag_ls.append(w.sqrt(ex_int))
+                  ex_int_ls.append(ex_int)
         del subobj_ls, probe_real_ls, probe_imag_ls
 
         # Output shape is [minibatch_size, y, x].
-        if len(ex_mag_ls) > 1:
-            ex_mag_ls = w.concatenate(ex_mag_ls, 0)
+        if len(ex_int_ls) > 1:
+            ex_int = w.concatenate(ex_int_ls, 0)
         else:
-            ex_mag_ls = ex_mag_ls[0]
+            ex_int = ex_int_ls[0]
+
+        if background_type != 'none' and background is not None:
+            if background_type == 'per_detector':
+                bg = w.expand_dims(background, axis=0)
+                bg = w.tile(bg, [ex_int.shape[0], 1, 1])
+            elif background_type == 'per_angle':
+                bg = background[this_i_theta]
+                if len(bg.shape) == 2:
+                    bg = w.expand_dims(bg, axis=0)
+                bg = w.tile(bg, [ex_int.shape[0], 1, 1])
+            elif background_type == 'per_pattern':
+                indexer = list(this_ind_batch)
+                bg = background[this_i_theta, indexer]
+            else:
+                raise ValueError('Unsupported background_type: {}'.format(background_type))
+            ex_int = ex_int + bg
+
+        ex_int = w.maximum(ex_int, 0)
+        ex_mag_ls = w.sqrt(ex_int)
         if rank == 0 and debug and self.i_call % 10 == 0:
             ex_mag_val = w.to_numpy(ex_mag_ls)
             dxchange.write_tiff(ex_mag_val, os.path.join(output_folder, 'intermediate', 'detected_mag'),
@@ -794,12 +872,12 @@ class SparseMultisliceModel(ForwardModel):
     def get_loss_function(self):
         def calculate_loss(obj, probe_real, probe_imag, probe_defocus_mm,
                            probe_pos_offset, this_i_theta, this_pos_batch, prj,
-                           probe_pos_correction, this_ind_batch, slice_pos_cm_ls, prj_pos_offset):
+                           background, probe_pos_correction, this_ind_batch, slice_pos_cm_ls, prj_pos_offset):
             theta_downsample = self.common_vars['theta_downsample']
             ds_level = self.common_vars['ds_level']
             this_pred_batch = self.predict(obj, probe_real, probe_imag, probe_defocus_mm,
                                            probe_pos_offset, this_i_theta, this_pos_batch, prj,
-                                           probe_pos_correction, this_ind_batch, slice_pos_cm_ls, prj_pos_offset)
+                                           background, probe_pos_correction, this_ind_batch, slice_pos_cm_ls, prj_pos_offset)
             this_prj_batch = self.get_data(this_i_theta, this_ind_batch, theta_downsample=theta_downsample, ds_level=ds_level)
             loss = self.loss(this_pred_batch, this_prj_batch, obj)
             return loss
@@ -818,7 +896,7 @@ class MultiDistModel(ForwardModel):
 
     def predict(self, obj, probe_real, probe_imag, probe_defocus_mm,
                 probe_pos_offset, this_i_theta, this_pos_batch, prj,
-                probe_pos_correction, this_ind_batch, free_prop_cm, safe_zone_width, prj_affine_ls, ctf_lg_kappa,
+                background, probe_pos_correction, this_ind_batch, free_prop_cm, safe_zone_width, prj_affine_ls, ctf_lg_kappa,
                 prj_pos_offset):
         """
         Calculated predicted measurment. The signature of this function exactly matches the function returned
@@ -874,6 +952,7 @@ class MultiDistModel(ForwardModel):
         u_free = self.common_vars['u_free']
         v_free = self.common_vars['v_free']
         optimize_ctf_lg_kappa = self.common_vars['optimize_ctf_lg_kappa']
+        background_type = self.common_vars.get('background_type', 'none')
 
         kappa = 10 ** ctf_lg_kappa[0] if optimize_ctf_lg_kappa else None
         if precalculate_rotation_coords:
@@ -994,7 +1073,7 @@ class MultiDistModel(ForwardModel):
             subprobe_imag_ls_ls.append(subprobe_subbatch_imag_ls)
             pos_ind += len(pos_batch)
 
-        ex_mag_ls = []
+        ex_int_ls = []
 
         for i_dist, this_dist in enumerate(free_prop_cm):
             for k, pos_batch in enumerate(probe_pos_batch_ls):
@@ -1016,13 +1095,32 @@ class MultiDistModel(ForwardModel):
                         ex_int = temp_real ** 2 + temp_imag ** 2
                     else:
                         ex_int = ex_int + temp_real ** 2 + temp_imag ** 2
-                ex_mag_ls.append(w.sqrt(ex_int))
+                ex_int_ls.append(ex_int)
 
         # Output shape is [minibatch_size, y, x].
-        if len(ex_mag_ls) > 1:
-            ex_mag_ls = w.concatenate(ex_mag_ls, 0)
+        if len(ex_int_ls) > 1:
+            ex_int = w.concatenate(ex_int_ls, 0)
         else:
-            ex_mag_ls = ex_mag_ls[0]
+            ex_int = ex_int_ls[0]
+
+        if background_type != 'none' and background is not None:
+            if background_type == 'per_detector':
+                bg = w.expand_dims(background, axis=0)
+                bg = w.tile(bg, [ex_int.shape[0], 1, 1])
+            elif background_type == 'per_angle':
+                bg = background[this_i_theta]
+                if len(bg.shape) == 2:
+                    bg = w.expand_dims(bg, axis=0)
+                bg = w.tile(bg, [ex_int.shape[0], 1, 1])
+            elif background_type == 'per_pattern':
+                indexer = list(this_ind_batch)
+                bg = background[this_i_theta, indexer]
+            else:
+                raise ValueError('Unsupported background_type: {}'.format(background_type))
+            ex_int = ex_int + bg
+
+        ex_int = w.maximum(ex_int, 0)
+        ex_mag_ls = w.sqrt(ex_int)
 
         if safe_zone_width > 0:
             ex_mag_ls = ex_mag_ls[:, safe_zone_width:safe_zone_width + subprobe_size[0],
@@ -1039,7 +1137,7 @@ class MultiDistModel(ForwardModel):
     def get_loss_function(self):
         def calculate_loss(obj, probe_real, probe_imag, probe_defocus_mm,
                            probe_pos_offset, this_i_theta, this_pos_batch, prj,
-                           probe_pos_correction, this_ind_batch, free_prop_cm, safe_zone_width,
+                           background, probe_pos_correction, this_ind_batch, free_prop_cm, safe_zone_width,
                            prj_affine_ls, ctf_lg_kappa, prj_pos_offset):
             theta_downsample = self.common_vars['theta_downsample']
             ds_level = self.common_vars['ds_level']
@@ -1049,7 +1147,7 @@ class MultiDistModel(ForwardModel):
 
             this_pred_batch = self.predict(obj, probe_real, probe_imag, probe_defocus_mm,
                                            probe_pos_offset, this_i_theta, this_pos_batch, prj,
-                                           probe_pos_correction, this_ind_batch, free_prop_cm, safe_zone_width,
+                                           background, probe_pos_correction, this_ind_batch, free_prop_cm, safe_zone_width,
                                            prj_affine_ls, ctf_lg_kappa, prj_pos_offset)
 
             if theta_downsample is None: theta_downsample = 1 

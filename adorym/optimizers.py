@@ -955,6 +955,19 @@ def create_and_initialize_parameter_optimizers(optimizable_params, kwargs):
         opt_args_ls.append(forward_model.get_argument_index('ctf_lg_kappa'))
         opt_ls.append(opt_ctf_lg_kappa)
 
+    if kwargs['background_type'] != 'none' and kwargs['optimize_background']:
+        if kwargs['optimizer_background'] is not None:
+            opt_background = kwargs['optimizer_background']
+            opt_background.name = 'background'
+        else:
+            optimizer_options_background = {'step_size': kwargs['background_learning_rate']}
+            opt_background = AdamOptimizer('background', output_folder=output_folder,
+                                           options_dict=optimizer_options_background, forward_model=forward_model)
+        opt_background.create_param_arrays(optimizable_params['background'].shape, device=device_obj)
+        opt_background.set_index_in_grad_return(len(opt_args_ls))
+        opt_args_ls.append(forward_model.get_argument_index('background'))
+        opt_ls.append(opt_background)
+
     return opt_ls, opt_args_ls
 
 
